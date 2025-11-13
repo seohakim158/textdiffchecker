@@ -1,15 +1,15 @@
 {
   "files": {
     "main.css": "/textdiffchecker/static/css/main.e6c13ad2.css",
-    "main.js": "/textdiffchecker/static/js/main.b6ec2a45.js",
+    "main.js": "/textdiffchecker/static/js/main.c35bbd05.js",
     "static/js/453.8ea90dfb.chunk.js": "/textdiffchecker/static/js/453.8ea90dfb.chunk.js",
     "index.html": "/textdiffchecker/index.html",
     "main.e6c13ad2.css.map": "/textdiffchecker/static/css/main.e6c13ad2.css.map",
-    "main.b6ec2a45.js.map": "/textdiffchecker/static/js/main.b6ec2a45.js.map",
+    "main.c35bbd05.js.map": "/textdiffchecker/static/js/main.c35bbd05.js.map",
     "453.8ea90dfb.chunk.js.map": "/textdiffchecker/static/js/453.8ea90dfb.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.e6c13ad2.css",
-    "static/js/main.b6ec2a45.js"
+    "static/js/main.c35bbd05.js"
   ]
 }
