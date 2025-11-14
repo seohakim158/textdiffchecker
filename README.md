@@ -4,17 +4,17 @@ A React app to compare two texts and visualize the differences character by char
 
 ## Live Demo
 
-You can try the app online: [https://your-username.github.io/textdiffchecker](https://your-username.github.io/textdiffchecker)
+You can try the app online: [https://seohakim158.github.io/textdiffchecker](https://seohakim158.github.io/textdiffchecker)
 
 ## GitHub Repository
 
-Source code: [https://github.com/your-username/textdiffchecker](https://github.com/your-username/textdiffchecker)
+Source code: [https://github.com/seohakim158/textdiffchecker](https://github.com/seohakim158/textdiffchecker)
 
 ## Usage
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/textdiffchecker.git
+   git clone https://github.com/seohakim158/textdiffchecker.git
    cd textdiffchecker
    ```
 
@@ -57,7 +57,7 @@ For GitHub Pages:
 
 2. Add the homepage to your `package.json`:
    ```json
-   "homepage": "https://your-username.github.io/textdiffchecker"
+   "homepage": "https://seohakim158.github.io/textdiffchecker"
    ```
 
 3. Deploy:
