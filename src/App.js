@@ -1,16 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import DiffMatchPatch from "diff-match-patch";
-
-// --- Debounce helper ---
-function debounce(fn, ms) {
-  let timer;
-  function debounced(...args) {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
-  }
-  debounced.cancel = () => timer && clearTimeout(timer);
-  return debounced;
-}
+import VersionHistory from "./version";
 
 function App() {
   // --- State: text and diff output ---
@@ -80,572 +70,201 @@ function App() {
     localStorage.setItem("diff_trayItems", JSON.stringify(trayItems));
   }, [trayItems, trayLoaded]);
 
-  // --- Helper functions ---
-  const preprocess = useCallback((text) => {
-    let result = text;
-    if (ignoreCase) result = result.toLowerCase();
-    if (ignorePunctuation) result = result.replace(/[.,!/#$%^&*;:{}=\-_`~()"]/g, "");
-    return result;
-  }, [ignoreCase, ignorePunctuation]);
-
-  // Merge consecutive diffs efficiently (block-level, not per char)
-  function mergeDiffs(diffs, original, modified) {
-    let html = "";
-    let oIdx = 0;
-    let mIdx = 0;
-    let i = 0;
-    while (i < diffs.length) {
-      const [op, data] = diffs[i];
-      if (op === DiffMatchPatch.DIFF_EQUAL) {
-        let len = data.length;
-        html += original.substring(oIdx, oIdx + len);
-        oIdx += len;
-        mIdx += len;
-        i++;
-      } else if (op === DiffMatchPatch.DIFF_DELETE) {
-        let delLen = data.length;
-        let j = i + 1;
-        while (j < diffs.length && diffs[j][0] === DiffMatchPatch.DIFF_DELETE) {
-          delLen += diffs[j][1].length;
-          j++;
-        }
-        const s = original.substring(oIdx, oIdx + delLen);
-        html += (s.trim() !== "")
-          ? `<span style="background:#dc3545;color:white;text-decoration:line-through;padding:2px;border-radius:3px;">${s}</span>`
-          : s;
-        oIdx += delLen;
-        i = j;
-      } else if (op === DiffMatchPatch.DIFF_INSERT) {
-        let insLen = data.length;
-        let j = i + 1;
-        while (j < diffs.length && diffs[j][0] === DiffMatchPatch.DIFF_INSERT) {
-          insLen += diffs[j][1].length;
-          j++;
-        }
-        const s = modified.substring(mIdx, mIdx + insLen);
-        html += (s.trim() !== "")
-          ? `<span style="background:#28a745;color:black;padding:2px;border-radius:3px;">${s}</span>`
-          : s;
-        mIdx += insLen;
-        i = j;
-      }
-    }
-    return html;
-  }
-
-  // Efficiently count correct/non-highlighted letters (no DOM nodes)
-  function calculateCorrectLetters(html) {
-    let correctLetters = 0;
-    let totalLetters = 0;
-    let inSpan = false;
-    let i = 0;
-    while (i < html.length) {
-      if (!inSpan && html[i] === "<" && html.startsWith("<span", i)) {
-        inSpan = true;
-        // skip to '>'
-        let close = html.indexOf(">", i);
-        i = close >= 0 ? close + 1 : i + 1;
-        continue;
-      }
-      if (inSpan && html[i] === "<" && html.startsWith("</span>", i)) {
-        inSpan = false;
-        i += 7;
-        continue;
-      }
-      // Only count visible text, skip tags
-      if (!inSpan && html[i] !== "<") {
-        if (!/\s/.test(html[i])) correctLetters++;
-      }
-      if (html[i] !== "<" && html[i] !== ">") {
-        if (!/\s/.test(html[i])) totalLetters++;
-      }
-      i++;
-    }
-    // For total, also count letters inside spans
-    // So we need to count all non-whitespace letters that are not tags
-    // But above, totalLetters only counts outside of tags, so adjust:
-    // Instead, get text content (strip tags), then count non-whitespace
-    let textOnly = html.replace(/<[^>]+>/g, "");
-    totalLetters = (textOnly.match(/\S/g) || []).length;
-    return {
-      correctLetters,
-      totalLetters,
-      matchPercent: totalLetters > 0 ? (correctLetters / totalLetters) * 100 : 0
-    };
-  }
-
   // --- Main diff handler ---
-  // Memoize char-to-word maps for original and modified text
-  const origWordInfo = useMemo(() => buildCharToWordMap(oldText), [oldText]);
-  const modWordInfo = useMemo(() => buildCharToWordMap(newText), [newText]);
-
-  // Memoized buildCharToWordMap
-  function buildCharToWordMap(text) {
-    const words = [];
-    const charToWord = [];
-    let wordStart = null;
-    let curWordIdx = -1;
-    for (let i = 0; i < text.length; ++i) {
-      const ch = text[i];
-      if (/\s/.test(ch)) {
-        if (wordStart !== null) {
-          words.push({ start: wordStart, end: i });
-          curWordIdx++;
-          wordStart = null;
-        }
-        charToWord.push(curWordIdx + 1);
-      } else {
-        if (wordStart === null) wordStart = i;
-        charToWord.push(curWordIdx + 1);
-      }
-    }
-    if (wordStart !== null) {
-      words.push({ start: wordStart, end: text.length });
-    }
-    return { words, charToWord };
-  }
-
-  // --- Main diff handler (debounced, throttled) ---
   const handleDiffCore = useCallback(() => {
-    if (
-      resultsShown &&
-      oldText === lastOldTextRef.current &&
-      newText === lastNewTextRef.current
-    ) {
-      setResultsShown(false);
-      return;
+    function preprocessForCompare(text) {
+      let result = text;
+      if (ignoreCase) result = result.toLowerCase();
+      if (ignorePunctuation) result = result.replace(/\p{P}/gu, "");
+      return result;
     }
 
-    let original = oldText;
-    let modified = newText;
-    // --- Memoriser mode logic: only compare up to the number of words in the modified text.
-    if (memoriser) {
-      const origWords = original.split(/\s+/).filter(w => w.trim() !== "");
-      const modWords = modified.split(/\s+/).filter(w => w.trim() !== "");
-      const targetWordCount = modWords.length;
-      original = origWords.slice(0, targetWordCount).join(" ");
-      modified = modWords.slice(0, targetWordCount).join(" ");
-    }
-    // Create processed strings and index maps only when ignore options are enabled.
-    const procOrig = preprocess(original);
-    const procMod = preprocess(modified);
+    const escapeHtml = (s) =>
+      (s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
 
-    // Build mapping from processed-string indices back to original indices so we can map diffs
-    // to positions in the real original/modified strings (preserving display text).
-    function buildIndexMap(fromText, processedText) {
-      const map = [];
-      let p = 0;
-      for (let i = 0; i < fromText.length && p < processedText.length; ++i) {
-        const ch = fromText[i];
-        const transformed = (() => {
-          let t = ch;
-          if (ignoreCase) t = t.toLowerCase();
-          if (ignorePunctuation) t = t.replace(/[.,!/#$%^&*;:{}=\-_`~()\"]/g, "");
-          return t;
-        })();
-        if (transformed === "") continue; // removed by preprocess
-        // transformed might be multiple chars removed by punctuation removal; compare char by char
-        for (let k = 0; k < transformed.length && p < processedText.length; ++k) {
-          // map processed index p back to original index i
-          map[p] = i;
-          p++;
+    const calculateStatsFromHtml = (html) => {
+      let correct = 0, total = 0, inSpan = false, i = 0;
+      while (i < html.length) {
+        if (!inSpan && html.startsWith("<span", i)) {
+          inSpan = true;
+          const close = html.indexOf(">", i);
+          i = close >= 0 ? close + 1 : i + 1;
+          continue;
         }
+        if (inSpan && html.startsWith("</span>", i)) {
+          inSpan = false;
+          i += 7;
+          continue;
+        }
+        if (html[i] === "<") {
+          const close = html.indexOf(">", i);
+          i = close >= 0 ? close + 1 : i + 1;
+          continue;
+        }
+        if (!/\s/.test(html[i])) {
+          if (!inSpan) correct++;
+          total++;
+        }
+        i++;
       }
-      return map;
-    }
+      return { correctLetters: correct, totalLetters: total, matchPercent: total ? (correct / total) * 100 : 0 };
+    };
 
-    // If neither option is enabled, do a direct diff on original strings (fast, simple).
-    let diffs;
-    let procOrigToOrigMap = null;
-    let procModToModMap = null;
-    const dmp = new DiffMatchPatch();
-    if (!ignoreCase && !ignorePunctuation) {
-      // Use raw strings for diffs so indices match original text exactly
-      diffs = dmp.diff_main(original, modified);
-    } else {
-      // Use processed strings for comparison, but keep maps to original/modified indices
-      procOrigToOrigMap = buildIndexMap(original, procOrig);
-      procModToModMap = buildIndexMap(modified, procMod);
-      diffs = dmp.diff_main(procOrig, procMod);
-    }
-    dmp.diff_cleanupSemantic(diffs);
-
-    const wordInfo = buildCharToWordMap(original);
-
-    // Collect changed char ranges mapped to original text positions
-    let origIdx = 0; // index within the string used for diffs (either original or processed)
-    let modIdx = 0;  // same for modified/processed
-    const changedCharPositions = [];
-    for (let [op, data] of diffs) {
-      if (op === DiffMatchPatch.DIFF_EQUAL) {
-        origIdx += data.length;
-        modIdx += data.length;
-      } else if (op === DiffMatchPatch.DIFF_DELETE) {
-        if (data.length > 0) {
-          if (!ignoreCase && !ignorePunctuation) {
-            // diffs were computed on raw original -> indices map directly
-            changedCharPositions.push([origIdx, origIdx + data.length - 1]);
+    // --- Core: diff with ignore case/punctuation for comparison, original for display ---
+    function buildDiffWithHighlights(orig, mod, ignoreCase, ignorePunctuation) {
+      const origComp = preprocessForCompare(orig);
+      const modComp = preprocessForCompare(mod);
+      function buildMap(raw, processed) {
+        let map = [];
+        let r = 0, p = 0;
+        while (r < raw.length && p < processed.length) {
+          let rawChar = raw[r];
+          let procChar = processed[p];
+          if (ignoreCase) rawChar = rawChar.toLowerCase();
+          if (ignorePunctuation && /\p{P}/u.test(rawChar)) {
+            r++;
+            continue;
+          }
+          if (rawChar === procChar) {
+            map.push(r);
+            r++;
+            p++;
           } else {
-            // diffs were computed on processed strings -> map processed indices back to original
-            const startProc = origIdx;
-            const endProc = origIdx + data.length - 1;
-            const startOrig = (procOrigToOrigMap && procOrigToOrigMap[startProc] !== undefined) ? procOrigToOrigMap[startProc] : null;
-            const endOrig = (procOrigToOrigMap && procOrigToOrigMap[endProc] !== undefined) ? procOrigToOrigMap[endProc] : null;
-            if (startOrig !== null && endOrig !== null) {
-              changedCharPositions.push([startOrig, endOrig]);
-            } else if (startOrig !== null) {
-              changedCharPositions.push([startOrig, startOrig]);
+            if (/\s/.test(raw[r])) {
+              r++;
+            } else {
+              map.push(r);
+              r++;
+              p++;
             }
           }
         }
-        origIdx += data.length;
-      } else if (op === DiffMatchPatch.DIFF_INSERT) {
-        if (!ignoreCase && !ignorePunctuation) {
-          // insertion length applies to modified; mark a zero-width insertion at current origIdx
-          changedCharPositions.push([origIdx, origIdx]);
-        } else {
-          // For processed diffs, we map an insertion in processed modified back to a position in original modified
-          const startProc = modIdx;
-          const mappedIdx = (procModToModMap && procModToModMap[startProc] !== undefined) ? procModToModMap[startProc] : null;
-          if (mappedIdx !== null) changedCharPositions.push([mappedIdx, mappedIdx]);
-        }
-        modIdx += data.length;
+        while (map.length < processed.length) map.push(r);
+        return map;
       }
+      const origMap = buildMap(orig, origComp);
+      const modMap = buildMap(mod, modComp);
+      const dmp = new DiffMatchPatch();
+      const diffs = dmp.diff_main(origComp, modComp);
+      dmp.diff_cleanupSemantic(diffs);
+      let html = "";
+      let oCompIdx = 0, mCompIdx = 0;
+      for (const [op, data] of diffs) {
+        if (op === DiffMatchPatch.DIFF_EQUAL) {
+          const len = data.length;
+          if (len === 0) continue;
+          const start = oCompIdx < origMap.length ? origMap[oCompIdx] : orig.length;
+          const end = (oCompIdx + len - 1) < origMap.length ? origMap[oCompIdx + len - 1] + 1 : orig.length;
+          html += escapeHtml(orig.slice(start, end));
+          oCompIdx += len;
+          mCompIdx += len;
+        } else if (op === DiffMatchPatch.DIFF_DELETE) {
+          const len = data.length;
+          if (len === 0) continue;
+          const start = oCompIdx < origMap.length ? origMap[oCompIdx] : orig.length;
+          const end = (oCompIdx + len - 1) < origMap.length ? origMap[oCompIdx + len - 1] + 1 : orig.length;
+          const s = orig.slice(start, end);
+          html += s.trim()
+            ? `<span class="del" style="background:#dc3545;color:white;text-decoration:line-through;padding:2px;border-radius:3px;">${escapeHtml(s)}</span>`
+            : escapeHtml(s);
+          oCompIdx += len;
+        } else if (op === DiffMatchPatch.DIFF_INSERT) {
+          const len = data.length;
+          if (len === 0) continue;
+          const start = mCompIdx < modMap.length ? modMap[mCompIdx] : mod.length;
+          const end = (mCompIdx + len - 1) < modMap.length ? modMap[mCompIdx + len - 1] + 1 : mod.length;
+          const s = mod.slice(start, end);
+          html += s.trim()
+            ? `<span class="ins" style="background:#28a745;color:black;padding:2px;border-radius:3px;">${escapeHtml(s)}</span>`
+            : escapeHtml(s);
+          mCompIdx += len;
+        }
+      }
+      return html;
     }
 
-    // Build fullHtml with merged highlights
-    const fullHtml = mergeDiffs(diffs, original, modified);
+    const applyContextMode = (html) => {
+      const words = html.split(/\s+/);
+      const highlightIdx = [];
+      words.forEach((w, i) => {
+        if (w.includes('class="ins"') || w.includes('class="del"')) highlightIdx.push(i);
+      });
+      if (!highlightIdx.length) return words.slice(0, Math.min(3, words.length)).join(" ");
+      const chunks = [];
+      for (const idx of highlightIdx) {
+        const from = Math.max(0, idx - 3);
+        const to = Math.min(words.length - 1, idx + 3);
+        if (!chunks.length) chunks.push([from, to]);
+        else {
+          const last = chunks[chunks.length - 1];
+          if (from <= last[1] + 1) last[1] = Math.max(last[1], to);
+          else chunks.push([from, to]);
+        }
+      }
+      let ellipsisStart = false, ellipsisEnd = false;
+      if (chunks[0][0] > 0) ellipsisStart = true;
+      if (chunks[0][0] > 3) ellipsisStart = true;
+      if (chunks[chunks.length - 1][1] < words.length - 1) ellipsisEnd = true;
+      if (chunks[chunks.length - 1][1] < words.length - 4) ellipsisEnd = true;
+      let chunkHtml = chunks.map(([from, to]) => words.slice(from, to + 1).join(" ")).join("<br/><br/>...<br/><br/>");
+      if (ellipsisStart) chunkHtml = "...<br/><br/>" + chunkHtml;
+      if (ellipsisEnd) chunkHtml = chunkHtml + "<br/><br/>...";
+      return chunkHtml;
+    };
 
-    // Only update state if values changed
-    function updateDiffState(html) {
-      const { correctLetters: cl, totalLetters: tl, matchPercent: mp } = calculateCorrectLetters(html);
-      if (diffHtml !== html) setDiffHtml(html);
-      if (correctLetters !== cl) setCorrectLetters(cl);
-      if (totalLetters !== tl) setTotalLetters(tl);
-      if (matchPercent !== mp) setMatchPercent(mp);
-    }
+    const original = oldText || "";
+    const modified = newText || "";
 
-    // If no changes, just show the fullHtml
-    if (changedCharPositions.length === 0) {
-      updateDiffState(fullHtml);
+    if (!memoriser) {
+      const html = buildDiffWithHighlights(original, modified, ignoreCase, ignorePunctuation);
+      const stats = calculateStatsFromHtml(html);
+      setDiffHtml(html);
+      setCorrectLetters(stats.correctLetters);
+      setTotalLetters(stats.totalLetters);
+      setMatchPercent(stats.matchPercent);
       lastOldTextRef.current = oldText;
       lastNewTextRef.current = newText;
       return;
     }
 
-    // Build trimmedHtml for memoriser mode (chunked, char-level highlighting)
-    let trimmedHtml = "";
-    if (memoriser) {
-      // Per-word comparison up to the number of words in modified text.
-      const wordCount = wordInfo.words.length;
-      const origWords = wordInfo.words.map(w => original.slice(w.start, w.end));
-      const modWords = modified.split(/\s+/).filter(w => w.length > 0);
-      const compareLength = Math.min(modWords.length, wordCount);
-
-      // Find changed word indices (compare using preprocess() when options enabled)
-      // Improved: handle insertions at the start correctly (e.g. "nice to meet you" vs "hello nice to meet you")
-      const changedIndices = [];
-      let insertedAtStartCount = 0;
-      // Find the offset where the original and modified first match
-      let origIdx = 0, modIdx = 0;
-      while (
-        origIdx < origWords.length &&
-        modIdx < modWords.length &&
-        preprocess(origWords[origIdx]) === preprocess(modWords[modIdx])
-      ) {
-        origIdx++;
-        modIdx++;
-      }
-      // If modIdx > 0, then there are insertions at the start
-      if (modIdx > 0 && origIdx === 0) {
-        // All words before the first match are insertions
-        for (let i = 0; i < modIdx; ++i) changedIndices.push(i);
-        insertedAtStartCount = modIdx;
-      }
-      // Now, continue per-word comparison after the insertion(s) at start
-      for (let i = modIdx; i < compareLength; ++i) {
-        const origW = origWords[i - insertedAtStartCount] ?? "";
-        const modW = modWords[i] ?? "";
-        const procOrig = preprocess(origW);
-        const procMod = preprocess(modW);
-        if (procOrig !== procMod) changedIndices.push(i);
-      }
-
-      // Build trimmedHtml for memoriser mode regardless of changedIndices
-      // Merge changed indices into chunks of [start..end] with 3-word context each
-      const chunks = [];
-      for (const idx of changedIndices) {
-        const from = Math.max(0, idx - 3);
-        const to = Math.min(wordCount - 1, idx + 3);
-        if (chunks.length === 0) {
-          chunks.push([from, to]);
-        } else {
-          const last = chunks[chunks.length - 1];
-          if (from <= last[1] + 1) {
-            last[1] = Math.max(last[1], to);
-          } else {
-            chunks.push([from, to]);
-          }
-        }
-      }
-
-      function escapeHtml(s) {
-        return (s || "")
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/\"/g, "&quot;")
-          .replace(/'/g, "&#39;");
-      }
-
-      function renderWordWithCharDiff(origW, modW) {
-        if (origW === undefined) origW = "";
-        if (modW === undefined) modW = "";
-        if (origW === modW) return escapeHtml(origW);
-        const localDmp = new DiffMatchPatch();
-        const wdiffs = localDmp.diff_main(origW, modW);
-        localDmp.diff_cleanupSemantic(wdiffs);
-        let out = "";
-        for (const [op, data] of wdiffs) {
-          if (op === DiffMatchPatch.DIFF_EQUAL) {
-            out += escapeHtml(data);
-          } else if (op === DiffMatchPatch.DIFF_DELETE) {
-            out += `<span style="background:#dc3545;color:white;text-decoration:line-through;padding:2px;border-radius:3px;">${escapeHtml(data)}</span>`;
-          } else if (op === DiffMatchPatch.DIFF_INSERT) {
-            out += `<span style="background:#28a745;color:black;padding:2px;border-radius:3px;">${escapeHtml(data)}</span>`;
-          }
-        }
-        return out;
-      }
-
-      // Build each chunk as concatenation of original text words but replace changed words with inline diffs.
-      const chunkHtmlParts = [];
-      for (let c = 0; c < chunks.length; ++c) {
-        const [startIdx, endIdx] = chunks[c];
-        let piece = "";
-        for (let wi = startIdx; wi <= endIdx; ++wi) {
-          // For words that were inserted at the start, there is no original word: display as insertion
-          let origToken, modToken;
-          if (wi < insertedAtStartCount) {
-            origToken = "";
-            modToken = modWords[wi] ?? "";
-          } else {
-            const span = wordInfo.words[wi - insertedAtStartCount];
-            origToken = span ? original.slice(span.start, span.end) : "";
-            modToken = (wi < modWords.length) ? modWords[wi] : "";
-          }
-          // Determine if this word was changed (using preprocess comparison)
-          let changed = changedIndices.includes(wi);
-          if (changed) {
-            piece += renderWordWithCharDiff(origToken, modToken || "");
-          } else {
-            piece += escapeHtml(origToken);
-          }
-          // Preserve the following whitespace character from the original (if any)
-          if (wi >= insertedAtStartCount && wordInfo.words[wi - insertedAtStartCount]) {
-            const span = wordInfo.words[wi - insertedAtStartCount];
-            if (span.end < original.length && /\s/.test(original[span.end])) {
-              piece += original[span.end];
-            } else {
-              if (wi !== endIdx) piece += " ";
-            }
-          } else {
-            // For inserted-at-start words, just add a space if not last in chunk
-            if (wi !== endIdx) piece += " ";
-          }
-        }
-        chunkHtmlParts.push(piece);
-      }
-      trimmedHtml = chunkHtmlParts.map(p => p).join('<br/>...<br/>');
-
-      // Memoriser mode: choose display based on which has higher matchPercent
-      if (memoriser) {
-        // Build trimmedHtml for memoriser highlighting
-        const trimmedHtmlParts = chunkHtmlParts.map(p => p).join('<br/>...<br/>');
-
-        // Calculate match stats for both trimmedHtml and fullHtml
-        const memStats = calculateCorrectLetters(trimmedHtmlParts);
-        const nonMemStats = calculateCorrectLetters(fullHtml);
-
-        // Decide which display to use based on higher matchPercent
-        if (nonMemStats.matchPercent > memStats.matchPercent) {
-          // Use fullHtml display if its matchPercent is higher
-          updateDiffState(fullHtml);
-        } else {
-          // Otherwise use memoriser trimmedHtml
-          if (diffHtml !== trimmedHtmlParts) setDiffHtml(trimmedHtmlParts);
-          if (correctLetters !== memStats.correctLetters) setCorrectLetters(memStats.correctLetters);
-          if (totalLetters !== memStats.totalLetters) setTotalLetters(memStats.totalLetters);
-          if (matchPercent !== memStats.matchPercent) setMatchPercent(memStats.matchPercent);
-        }
-
-        lastOldTextRef.current = oldText;
-        lastNewTextRef.current = newText;
-        return;
-      } else {
-        updateDiffState(fullHtml);
-      }
+    // --- Memoriser mode ---
+    const origWords = original.split(/\s+/).filter(Boolean);
+    const modWords = modified.split(/\s+/).filter(Boolean);
+    const typedWords = modWords.slice(0, origWords.length);
+    const memHtmlFull = buildDiffWithHighlights(original, typedWords.join(" "), ignoreCase, ignorePunctuation);
+    const memStats = calculateStatsFromHtml(memHtmlFull);
+    const nmHtmlFull = buildDiffWithHighlights(original, modified, ignoreCase, ignorePunctuation);
+    const nmStats = calculateStatsFromHtml(nmHtmlFull);
+    let chosenHtml, chosenStats;
+    if (memStats.matchPercent >= nmStats.matchPercent) {
+      chosenHtml = memHtmlFull;
+      chosenStats = memStats;
     } else {
-      // In non-memoriser mode, virtually append a space after each original word for diffing purposes,
-      // if the word does not have a space immediately after it.
-      // This ensures end-of-word differences are detected, and now the display also shows these spaces.
-      let origForDiff = original;
-      let virtualSpacePositions = new Set(); // indices in origForDiff where a virtual space was added
-      if (original.length > 0) {
-        // Find word boundaries
-        const wordSpans = buildCharToWordMap(original).words;
-        let lastIdx = 0;
-        let pieces = [];
-        let runningLength = 0;
-        for (let i = 0; i < wordSpans.length; ++i) {
-          const span = wordSpans[i];
-          // Push text before this word (should be whitespace or nothing)
-          if (lastIdx < span.start) {
-            pieces.push(original.slice(lastIdx, span.start));
-            runningLength += span.start - lastIdx;
-          }
-          let word = original.slice(span.start, span.end);
-          let addVirtualSpace = false;
-          // If next char is not whitespace (or at end), add a virtual space (for diffing and display)
-          if (
-            span.end === original.length ||
-            (span.end < original.length && !/\s/.test(original[span.end]))
-          ) {
-            addVirtualSpace = true;
-          }
-          pieces.push(word);
-          runningLength += word.length;
-          if (addVirtualSpace) {
-            pieces.push(" ");
-            virtualSpacePositions.add(runningLength); // position in origForDiff where the virtual space is
-            runningLength += 1;
-          }
-          lastIdx = span.end;
-        }
-        // Add any trailing text
-        if (lastIdx < original.length) {
-          pieces.push(original.slice(lastIdx));
-        }
-        origForDiff = pieces.join("");
-      } else {
-        origForDiff = original;
-      }
-      // Use the (possibly virtually spaced) original for diffing, and display the same (including virtual spaces).
-      let diffsForDisplay;
-      if (!ignoreCase && !ignorePunctuation) {
-        // Use raw strings for diffs so indices match original text exactly
-        const dmp2 = new DiffMatchPatch();
-        diffsForDisplay = dmp2.diff_main(origForDiff, modified);
-        dmp2.diff_cleanupSemantic(diffsForDisplay);
-        // When building HTML, use the virtually spaced original text, and display virtual spaces as normal spaces.
-        let html = "";
-        let oIdx = 0; // index in origForDiff
-        let mIdx = 0; // index in modified
-        let i = 0;
-        while (i < diffsForDisplay.length) {
-          const [op, data] = diffsForDisplay[i];
-          if (op === DiffMatchPatch.DIFF_EQUAL) {
-            // For equal, show original text (including virtual spaces)
-            let len = data.length;
-            html += origForDiff.slice(oIdx, oIdx + len);
-            oIdx += len;
-            mIdx += len;
-            i++;
-          } else if (op === DiffMatchPatch.DIFF_DELETE) {
-            let delLen = data.length;
-            let j = i + 1;
-            while (j < diffsForDisplay.length && diffsForDisplay[j][0] === DiffMatchPatch.DIFF_DELETE) {
-              delLen += diffsForDisplay[j][1].length;
-              j++;
-            }
-            // For deletion, display all deleted chars (including virtual spaces), and highlight them
-            let sDisplay = origForDiff.slice(oIdx, oIdx + delLen);
-            html += (sDisplay.trim() !== "")
-              ? `<span style="background:#dc3545;color:white;text-decoration:line-through;padding:2px;border-radius:3px;">${sDisplay}</span>`
-              : sDisplay;
-            oIdx += delLen;
-            i = j;
-          } else if (op === DiffMatchPatch.DIFF_INSERT) {
-            let insLen = data.length;
-            let j = i + 1;
-            while (j < diffsForDisplay.length && diffsForDisplay[j][0] === DiffMatchPatch.DIFF_INSERT) {
-              insLen += diffsForDisplay[j][1].length;
-              j++;
-            }
-            const s = modified.substring(mIdx, mIdx + insLen);
-            html += (s.trim() !== "")
-              ? `<span style="background:#28a745;color:black;padding:2px;border-radius:3px;">${s}</span>`
-              : s;
-            mIdx += insLen;
-            i = j;
-          }
-        }
-        updateDiffState(html);
-      } else {
-        // Use processed strings for comparison, but keep maps to original/modified indices
-        procOrigToOrigMap = buildIndexMap(origForDiff, preprocess(origForDiff));
-        procModToModMap = buildIndexMap(modified, procMod);
-        const dmp2 = new DiffMatchPatch();
-        diffsForDisplay = dmp2.diff_main(preprocess(origForDiff), procMod);
-        dmp2.diff_cleanupSemantic(diffsForDisplay);
-        // Build changedCharPositions and HTML as above, but map indices back to virtually spaced original
-        let origIdx2 = 0; // index in preprocessed origForDiff
-        let modIdx2 = 0; // index in preprocessed modified
-        let html = "";
-        for (let i = 0; i < diffsForDisplay.length; ++i) {
-          const [op, data] = diffsForDisplay[i];
-          if (op === DiffMatchPatch.DIFF_EQUAL) {
-            // Map processed index to virtually spaced original index
-            for (let k = 0; k < data.length; ++k) {
-              const origPos = procOrigToOrigMap[origIdx2 + k];
-              if (origPos !== undefined && origPos < origForDiff.length) {
-                html += origForDiff[origPos];
-              }
-            }
-            origIdx2 += data.length;
-            modIdx2 += data.length;
-          } else if (op === DiffMatchPatch.DIFF_DELETE) {
-            // For delete, build span, using virtually spaced original
-            let sDisplay = "";
-            for (let k = 0; k < data.length; ++k) {
-              const origPos = procOrigToOrigMap[origIdx2 + k];
-              if (origPos !== undefined && origPos < origForDiff.length) {
-                sDisplay += origForDiff[origPos];
-              }
-            }
-            html += (sDisplay.trim() !== "")
-              ? `<span style="background:#dc3545;color:white;text-decoration:line-through;padding:2px;border-radius:3px;">${sDisplay}</span>`
-              : sDisplay;
-            origIdx2 += data.length;
-          } else if (op === DiffMatchPatch.DIFF_INSERT) {
-            // For insert, use modified string
-            let s = "";
-            for (let k = 0; k < data.length; ++k) {
-              const modPos = procModToModMap[modIdx2 + k];
-              if (modPos !== undefined && modPos < modified.length) {
-                s += modified[modPos];
-              }
-            }
-            html += (s.trim() !== "")
-              ? `<span style="background:#28a745;color:black;padding:2px;border-radius:3px;">${s}</span>`
-              : s;
-            modIdx2 += data.length;
-          }
-        }
-        updateDiffState(html);
-      }
+      chosenHtml = nmHtmlFull;
+      chosenStats = nmStats;
     }
-
+    if (memoriser && chosenStats.matchPercent === 100) {
+      setDiffHtml("");
+      setCorrectLetters(chosenStats.correctLetters);
+      setTotalLetters(chosenStats.totalLetters);
+      setMatchPercent(chosenStats.matchPercent);
+      lastOldTextRef.current = oldText;
+      lastNewTextRef.current = newText;
+      return;
+    }
+    const finalHtml = applyContextMode(chosenHtml);
+    setDiffHtml(finalHtml);
+    setCorrectLetters(chosenStats.correctLetters);
+    setTotalLetters(chosenStats.totalLetters);
+    setMatchPercent(chosenStats.matchPercent);
     lastOldTextRef.current = oldText;
     lastNewTextRef.current = newText;
-  // eslint-disable-next-line
-  }, [resultsShown, oldText, newText, memoriser, preprocess, diffHtml, correctLetters, totalLetters, matchPercent]);
-
-  // Debounced handleDiff for large input performance
-  const debouncedHandleDiff = useMemo(
-    () => debounce(() => handleDiffCore(), 200),
-    [handleDiffCore]
-  );
+  }, [oldText, newText, memoriser, ignoreCase, ignorePunctuation]);
 
   // --- Keydown handler (memoized) ---
   const handleKeyDown = useCallback((e) => {
@@ -688,7 +307,7 @@ function App() {
       default:
         break;
     }
-  }, [resultsShown, oldText, newText, debouncedHandleDiff, setResultsShown]);
+  }, [resultsShown, oldText, newText, handleDiffCore, setResultsShown]);
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown);
@@ -762,7 +381,7 @@ function App() {
         flexDirection: "column",
         alignItems: "center",
         padding: "20px",
-        paddingTop: "120px",
+        paddingTop: "70px",
         textAlign: "center",
         position: "relative",
       }}
@@ -785,8 +404,8 @@ function App() {
               position: "absolute",
               top: "10px",
               left: "10px",
-              backgroundColor: "white",
-              border: "1px solid #555",
+              backgroundColor: "black",
+              border: "1px solid #FFF",
               borderRadius: "50%",
               width: "50px",
               height: "50px",
@@ -794,7 +413,7 @@ function App() {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              color: "black",
+              color: "white",
               fontSize: "1.2rem",
               cursor: "pointer",
               animation: "zoomIn 0.2s forwards",
@@ -802,22 +421,22 @@ function App() {
             }}
             onMouseEnter={e => {
               e.currentTarget.style.transform = "scale(1.05)";
-              e.currentTarget.style.backgroundColor = "black";
-              e.currentTarget.style.color = "white";
+              e.currentTarget.style.backgroundColor = "white";
+              e.currentTarget.style.color = "black";
               e.currentTarget.style.borderColor = "white";
             }}
             onMouseLeave={e => {
               e.currentTarget.style.animation = "zoomOut 0.18s";
               e.currentTarget.style.transform = "scale(1)";
-              e.currentTarget.style.backgroundColor = "white";
-              e.currentTarget.style.color = "black";
-              e.currentTarget.style.borderColor = "#555";
+              e.currentTarget.style.backgroundColor = "black";
+              e.currentTarget.style.color = "white";
+              e.currentTarget.style.borderColor = "white";
               setTimeout(() => {
                 if (e.currentTarget) e.currentTarget.style.animation = "";
               }, 180);
             }}
             onClick={e => {
-              setZenMode(prev => !prev); // toggle Zen mode
+              setZenMode(prev => !prev); 
               e.currentTarget.style.animation = "zoomOut 0.18s";
               e.currentTarget.style.transform = "scale(1)";
               setTimeout(() => {
@@ -825,7 +444,29 @@ function App() {
               }, 180);
             }}
           >
-            Z
+            {/* Zen Mode Icon - Peaceful Circle/Lotus */}
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"/>
+              <line x1="12" y1="2" x2="12" y2="6"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/>
+              <line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/>
+              <line x1="2" y1="12" x2="6" y2="12"/>
+              <line x1="18" y1="12" x2="22" y2="12"/>
+              <line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/>
+              <line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/>
+            </svg>
           </button>
         )}
       </div>
@@ -843,56 +484,89 @@ function App() {
           onMouseEnter={() => setHoverTopRight(true)}
           onMouseLeave={() => setHoverTopRight(false)}
         >
-          {hoverTopRight && (
-            <button
-              onClick={e => {
-                setShowModified(prev => !prev);
-                e.currentTarget.style.animation = "zoomOut 0.18s";
-                e.currentTarget.style.transform = "scale(1)";
-                setTimeout(() => {
-                  if (e.currentTarget) e.currentTarget.style.animation = "";
-                }, 180);
-              }}
-              style={{
-                position: "absolute",
-                top: "10px",
-                right: "10px",
-                backgroundColor: "white",
-                border: "1px solid #555",
-                borderRadius: "50%",
-                width: "50px",
-                height: "50px",
-                padding: "0",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "black",
-                fontSize: "1.2rem",
-                cursor: "pointer",
-                animation: "zoomIn 0.2s forwards",
-                transition: "background-color 0.2s, color 0.2s, border-color 0.2s, transform 0.2s",
-              }}
-              onMouseEnter={e => {
-                e.currentTarget.style.transform = "scale(1.05)";
-                e.currentTarget.style.backgroundColor = "black";
-                e.currentTarget.style.color = "white";
-                e.currentTarget.style.borderColor = "white";
-              }}
-              onMouseLeave={e => {
-                e.currentTarget.style.animation = "zoomOut 0.18s";
-                e.currentTarget.style.transform = "scale(1)";
-                e.currentTarget.style.backgroundColor = "white";
-                e.currentTarget.style.color = "black";
-                e.currentTarget.style.borderColor = "#555";
-                setTimeout(() => {
-                  if (e.currentTarget) e.currentTarget.style.animation = "";
-                }, 180);
-              }}
-            >
-              {showModified ? "H" : "S"}
-            </button>
-          )}
-        </div>
+        {hoverTopRight && (
+          <button
+            onClick={e => {
+              setShowModified(prev => !prev);
+              e.currentTarget.style.animation = "zoomOut 0.18s";
+              e.currentTarget.style.transform = "scale(1)";
+              setTimeout(() => {
+                if (e.currentTarget) e.currentTarget.style.animation = "";
+              }, 180);
+            }}
+            style={{
+              position: "absolute",
+              top: "10px",
+              right: "10px",
+              backgroundColor: "black",
+              border: "1px solid #FFF",
+              borderRadius: "50%",
+              width: "50px",
+              height: "50px",
+              padding: "0",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "white",
+              fontSize: "1.2rem",
+              cursor: "pointer",
+              animation: "zoomIn 0.2s forwards",
+              transition: "background-color 0.2s, color 0.2s, border-color 0.2s, transform 0.2s",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.13)",
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.transform = "scale(1.05)";
+              e.currentTarget.style.backgroundColor = "white";
+              e.currentTarget.style.color = "black";
+              e.currentTarget.style.borderColor = "white";
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.animation = "zoomOut 0.18s";
+              e.currentTarget.style.transform = "scale(1)";
+              e.currentTarget.style.backgroundColor = "black";
+              e.currentTarget.style.color = "white";
+              e.currentTarget.style.borderColor = "white";
+              setTimeout(() => {
+                if (e.currentTarget) e.currentTarget.style.animation = "";
+              }, 180);
+            }}
+          >
+            {showModified ? (
+              // Eye Open Icon
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            ) : (
+              // Eye Closed Icon
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                <line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            )}
+          </button>
+        )}
+      </div>
       )}
 
       {/* Right edge hover trigger */}
@@ -969,7 +643,7 @@ function App() {
                   }}
                   style={{
                     width: "100%",
-                    borderRadius: "5px",            // stays the same
+                    borderRadius: "5px", 
                     border: "1px solid #333",
                     backgroundColor: glowingItemId === item.id ? "#fff" : "#222",
                     color: glowingItemId === item.id ? "#000" : "#fff",
@@ -984,7 +658,7 @@ function App() {
                     boxShadow: glowingItemId === item.id ? "0 0 10px 2px rgba(30,144,255,0.7)" : "none",
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.transform = "scale(1.05)"; // scales entire button
+                    e.currentTarget.style.transform = "scale(1.05)"; 
                     if (glowingItemId !== item.id) e.currentTarget.style.backgroundColor = "#333";
                   }}
                   onMouseLeave={(e) => {
@@ -1251,16 +925,16 @@ function App() {
           }}
           onMouseEnter={e => {
             e.currentTarget.style.transform = "scale(1.05)";
-            e.currentTarget.style.backgroundColor = "black";
-            e.currentTarget.style.color = "white";
+            e.currentTarget.style.backgroundColor = "white";
+            e.currentTarget.style.color = "black";
             e.currentTarget.style.borderColor = "white";
           }}
           onMouseLeave={e => {
             e.currentTarget.style.animation = "zoomOut 0.18s";
             e.currentTarget.style.transform = "scale(1)";
-            e.currentTarget.style.backgroundColor = "white";
-            e.currentTarget.style.color = "black";
-            e.currentTarget.style.borderColor = "#555";
+            e.currentTarget.style.backgroundColor = "black";
+            e.currentTarget.style.color = "white";
+            e.currentTarget.style.borderColor = "white";
             setTimeout(() => {
               if (e.currentTarget) e.currentTarget.style.animation = "";
             }, 180);
@@ -1274,8 +948,24 @@ function App() {
             }, 180);
           }}
         >
-          V
-        </button>
+            {/* Version History Icon - Clock with circular arrow */}
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+              <path d="M21 12a9 9 0 1 1-9-9"/>
+              <polyline points="17 3 21 3 21 7"/>
+            </svg>
+          </button>
       </div>
 
       {/* Bottom right corner - GitHub button (circular and animated like top buttons, hidden by default, show on hover/zoom) */}
@@ -1346,21 +1036,20 @@ function App() {
             }}
             onMouseEnter={e => {
               e.currentTarget.style.transform = "scale(1.05)";
-              e.currentTarget.style.backgroundColor = "black";
-              e.currentTarget.style.color = "white";
+              e.currentTarget.style.backgroundColor = "white";
+              e.currentTarget.style.color = "black";
               e.currentTarget.style.borderColor = "white";
             }}
             onMouseLeave={e => {
               e.currentTarget.style.animation = "zoomOut 0.18s";
               e.currentTarget.style.transform = "scale(1)";
-              e.currentTarget.style.backgroundColor = "white";
-              e.currentTarget.style.color = "black";
-              e.currentTarget.style.borderColor = "#555";
+              e.currentTarget.style.backgroundColor = "black";
+              e.currentTarget.style.color = "white";
+              e.currentTarget.style.borderColor = "white";
               setTimeout(() => {
                 if (e.currentTarget) e.currentTarget.style.animation = "";
               }, 180);
             }}
-            // No onClick, just link
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -1380,56 +1069,7 @@ function App() {
         </a>
       </div>
 
-      {/* History popup */}
-      {showHistory && (
-        <div
-          style={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            width: "100vw",
-            height: "100vh",
-            backgroundColor: "rgba(0,0,0,0.7)",
-            display: "flex",
-            justifyContent: "center",
-            alignItems: "center",
-            zIndex: 1000,
-          }}
-          onClick={() => setShowHistory(false)}
-        >
-          <div
-            style={{
-              backgroundColor: "#000",
-              padding: "20px",
-              borderRadius: "10px",
-              minWidth: "300px",
-              color: "white",
-              border: "1px solid #333",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>Version History</h3>
-            <p>(No edits yet)</p>
-            <button
-              style={{
-                marginTop: "15px",
-                padding: "5px 10px",
-                cursor: "pointer",
-                borderRadius: "5px",
-                border: "none",
-                backgroundColor: "#1e90ff",
-                color: "white",
-                transition: "transform 0.2s",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.transform = "scale(1.05)")}
-              onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
-              onClick={() => setShowHistory(false)}
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      )}
+      {showHistory && <VersionHistory onClose={() => setShowHistory(false)} />}
       {resultsShown && (
         <div
           style={{
